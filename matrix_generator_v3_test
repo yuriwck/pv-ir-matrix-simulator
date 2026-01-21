@@ -1,0 +1,893 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+"""
+matrix_generator_v3_test.py
+===========================
+
+Simulador infravermelho (IR) para módulos fotovoltaicos (PV) em formato de matriz
+``sensores x deslocamento``. Este arquivo implementa:
+
+1) Geração de fundo saudável (gradientes + ruído correlacionado);
+2) Injeção sintética de defeitos (hotspots, PID, sombreamento, etc.);
+3) Conversão da matriz térmica para imagens 8-bit (pré-processamentos "centered" e "AGC");
+4) Rotina de teste rápida para visualização.
+
+O objetivo é permitir a geração reprodutível (quando a seed é fixada) de amostras que
+se aproximem qualitativamente de padrões térmicos observáveis em inspeções IR, com
+controles explícitos de ΔT e geometria (máscaras gaussianas, bandas, etc.).
+
+ATENÇÃO (NOMENCLATURA / COMPATIBILIDADE COM DATASET)
+----------------------------------------------------
+Este arquivo foi ajustado apenas na nomenclatura dos rótulos (DefectSpec.dtype /
+DefectSpec.description) para ser coerente com classes utilizadas no dataset.
+
+Mapeamentos relevantes (mantidos para compatibilidade com versões anteriores):
+- hotspot -> "cell"
+- multi_hotspot -> "cell-multi"
+- add_bypass_diode_failure -> retorna dtype "soiling"
+- crack -> "cracking"
+- shading -> "shadowing"
+- PID (add_pid) -> "diode" (left/right) ou "diode-multi" (both)
+- delamination -> retorna dtype "hot-spot-multi" (alias usado no dataset atual)
+
+Importante:
+- O padrão térmico de cada gerador não foi alterado nesta refatoração; apenas
+  documentação, organização e padronização de estilo.
+"""
+
+from __future__ import annotations
+
+import random
+from dataclasses import dataclass, field
+from typing import Dict, List, Optional, Tuple
+
+import cv2
+import matplotlib.pyplot as plt
+import numpy as np
+
+# =============================================================================
+# Constantes globais (dimensões e parâmetros de pré-processamento)
+# =============================================================================
+N_SENSORES: int = 22
+X_SAMPLES: int = 600
+
+TARGET_H: int = 40
+TARGET_W: int = 24
+
+SMART_AGC_MIN_SPAN: float = 10.0
+_EPS: float = 1e-6
+
+
+# =============================================================================
+# Estruturas de dados
+# =============================================================================
+@dataclass
+class DefectSpec:
+    """
+    Especificação de um defeito injetado.
+
+    Attributes:
+        dtype: Rótulo/categoria do defeito (compatível com classes do dataset).
+        description: Descrição humana do defeito.
+        delta_t_peak: Pico aproximado de ΔT aplicado (°C), usado como metadado.
+        params: Parâmetros do gerador (útil para rastreabilidade).
+    """
+
+    dtype: str
+    description: str
+    delta_t_peak: float
+    params: Dict[str, float] = field(default_factory=dict)
+
+
+# =============================================================================
+# Utilitários matemáticos
+# =============================================================================
+def gaussian2d(h: int, w: int, cy: float, cx: float, sy: float, sx: float) -> np.ndarray:
+    """
+    Gera uma máscara gaussiana 2D.
+
+    Args:
+        h: Altura (linhas).
+        w: Largura (colunas).
+        cy: Centro em y.
+        cx: Centro em x.
+        sy: Desvio padrão em y.
+        sx: Desvio padrão em x.
+
+    Returns:
+        np.ndarray (h, w) com valores em [0, 1] (não necessariamente normalizado).
+    """
+    y = np.arange(h, dtype=np.float32)
+    x = np.arange(w, dtype=np.float32)
+    yy, xx = np.meshgrid(y, x, indexing="ij")
+
+    div_sy = 2 * sy**2 if sy > 0 else 1e-5
+    div_sx = 2 * sx**2 if sx > 0 else 1e-5
+    return np.exp(-(((yy - cy) ** 2) / div_sy + ((xx - cx) ** 2) / div_sx))
+
+
+# =============================================================================
+# Fundo saudável
+# =============================================================================
+def healthy_background(base_temp: float) -> np.ndarray:
+    """
+    Gera um fundo saudável: gradiente vertical leve + offsets por linha + ruído.
+
+    Ponto crítico:
+        - Este fundo usa ruído com suavização (GaussianBlur) para induzir correlação
+          espacial ao longo do eixo de deslocamento, reduzindo padrões "pontilhados".
+
+    Args:
+        base_temp: Temperatura base (°C) do módulo.
+
+    Returns:
+        Matriz (N_SENSORES, X_SAMPLES) em float32.
+    """
+    grad_v = np.linspace(
+        0.0, np.random.uniform(0.0, 0.8), N_SENSORES
+    ).reshape(-1, 1).astype(np.float32)
+
+    noise = np.random.normal(0.0, 0.5, (N_SENSORES, X_SAMPLES)).astype(np.float32)
+    noise = cv2.GaussianBlur(noise, (1, 61), 0)  # suavização longitudinal (opcional)
+
+    row_offset = np.random.normal(0.0, 0.05, (N_SENSORES, 1)).astype(np.float32)
+
+    return (base_temp + grad_v + row_offset + noise).astype(np.float32)
+
+
+# =============================================================================
+# Geradores de defeitos
+# =============================================================================
+def add_pid(
+    mat: np.ndarray,
+    dt_range: Tuple[float, float] = (7.0, 15.0),
+    edge_strength: float = 0.5,
+    tau_frac: float = 0.2,
+) -> DefectSpec:
+    """
+    Injeta um padrão tipo PID (Potential-Induced Degradation) nas bordas do módulo.
+
+    Implementação:
+        - Perfil exponencial decrescente a partir de uma borda (left/right)
+          ou ambas (both).
+        - A escolha do modo é aleatória.
+
+    Args:
+        mat: Matriz térmica (modificada in-place).
+        dt_range: Faixa de ΔT aplicada (°C).
+        edge_strength: Peso relativo da segunda borda em modo "both".
+        tau_frac: Constante de decaimento relativa à largura (fração de w).
+
+    Returns:
+        DefectSpec com dtype "diode" ou "diode-multi" (por compatibilidade do dataset).
+    """
+    dt = float(np.random.uniform(*dt_range))
+    h, w = mat.shape
+    x = np.arange(w, dtype=np.float32)
+
+    tau = max(1e-6, w * float(tau_frac))
+    decay_left = np.exp(-x / tau)
+    decay_right = np.exp(-(w - x) / tau)
+
+    mode = random.choice(["left", "right", "both"])
+    if mode == "left":
+        profile = decay_left
+    elif mode == "right":
+        profile = decay_right
+    else:
+        profile = decay_left + decay_right * edge_strength
+
+    profile /= (profile.max() + _EPS)
+    mask = np.tile(profile, (h, 1))
+    mat += mask * dt
+
+    if mode == "both":
+        dtype, desc = "diode-multi", "Diode-Multi"
+    else:
+        dtype, desc = "diode", "Diode"
+
+    return DefectSpec(dtype, desc, dt, params={"mode": mode, "dt": dt, "tau_frac": tau_frac})
+
+
+def add_delamination(
+    mat: np.ndarray,
+    dt_range: Tuple[float, float] = (5.0, 20.0),
+    n_patches: Tuple[int, int] = (1, 3),
+) -> DefectSpec:
+    """
+    Injeta padrões difusos (patches) típicos de delaminação.
+
+    Observação de nomenclatura:
+        - Este gerador retorna dtype "hot-spot-multi", pois este é o alias utilizado
+          na versão atual do dataset (mantido para compatibilidade).
+
+    Args:
+        mat: Matriz térmica (modificada in-place).
+        dt_range: Faixa de ΔT aplicada (°C).
+        n_patches: Intervalo do número de patches gaussianos.
+
+    Returns:
+        DefectSpec com dtype "hot-spot-multi".
+    """
+    dt = float(np.random.uniform(*dt_range))
+    h, w = mat.shape
+    num = random.randint(n_patches[0], n_patches[1])
+
+    for _ in range(num):
+        cy = float(np.random.uniform(0, h))
+        cx = float(np.random.uniform(0, w))
+        sy = float(np.random.uniform(h * 0.2, h * 0.5))
+        sx = float(np.random.uniform(w * 0.1, w * 0.3))
+
+        blob = gaussian2d(h, w, cy, cx, sy, sx)
+        noise = np.random.normal(1.0, 0.2, blob.shape).astype(np.float32)
+        mask = blob * noise
+        mat += (mask / (mask.max() + _EPS)) * dt
+
+    return DefectSpec("hot-spot-multi", "Hot-Spot-Multi", dt, params={"n_patches": num, "dt": dt})
+
+
+def add_ribbon_failure(
+    mat: np.ndarray,
+    dt_range: Tuple[float, float] = (3.0, 10.0),
+    n_lines: Tuple[int, int] = (1, 3),
+) -> DefectSpec:
+    """
+    Injeta falhas em ribbons/busbars como linhas verticais estreitas.
+
+    Args:
+        mat: Matriz térmica (modificada in-place).
+        dt_range: Faixa de ΔT aplicada (°C).
+        n_lines: Intervalo do número de linhas.
+
+    Returns:
+        DefectSpec com dtype "ribbon".
+    """
+    dt = float(np.random.uniform(*dt_range))
+    h, w = mat.shape
+    num = random.randint(n_lines[0], n_lines[1])
+
+    mask = np.zeros_like(mat, dtype=np.float32)
+    for _ in range(num):
+        cx = int(np.random.randint(w))
+        thickness = int(np.random.randint(1, max(2, int(w * 0.02))))
+        x_start = max(0, cx - thickness // 2)
+        x_end = min(w, cx + thickness // 2 + 1)
+        mask[:, x_start:x_end] = 1.0
+
+    mask = cv2.GaussianBlur(mask, (1, 31), 0)
+    mat += mask * dt
+
+    return DefectSpec("ribbon", "Ribbon/Busbar", dt, params={"n_lines": num, "dt": dt})
+
+
+def add_multi_hotspot(
+    mat: np.ndarray,
+    count_range: Tuple[int, int] = (2, 5),
+    dt_range: Tuple[float, float] = (10.0, 40.0),
+) -> DefectSpec:
+    """
+    Injeta múltiplos hotspots (vários blobs gaussianos).
+
+    Nomenclatura:
+        - Retorna dtype "cell-multi".
+
+    Args:
+        mat: Matriz térmica (modificada in-place).
+        count_range: Intervalo do número de hotspots.
+        dt_range: Faixa de ΔT aplicada (°C) por hotspot.
+
+    Returns:
+        DefectSpec com dtype "cell-multi".
+    """
+    num = random.randint(*count_range)
+    dts: List[float] = []
+
+    for _ in range(num):
+        dt = float(np.random.uniform(*dt_range))
+        cy = float(np.random.uniform(2, N_SENSORES - 2))
+        cx = float(np.random.uniform(50, X_SAMPLES - 50))
+        sy = float(np.random.uniform(0.8, 2.5))
+        sx = float(np.random.uniform(10, 60))
+        blob = gaussian2d(N_SENSORES, X_SAMPLES, cy, cx, sy, sx)
+        mat += blob * dt
+        dts.append(dt)
+
+    return DefectSpec("cell-multi", "Cell-Multi", float(max(dts)), params={"n_hotspots": num, "dts": dts})
+
+
+def add_partial_shading(
+    mat: np.ndarray,
+    dt_range: Tuple[float, float] = (-20.0, -5.0),
+    area_fraction: Tuple[float, float] = (0.1, 0.7),
+) -> DefectSpec:
+    """
+    Injeta sombreamento parcial como uma região retangular suavizada.
+
+    Nomenclatura:
+        - Retorna dtype "shadowing".
+
+    Args:
+        mat: Matriz térmica (modificada in-place).
+        dt_range: Faixa de ΔT aplicada (°C); valores negativos indicam resfriamento.
+        area_fraction: Fração da largura ocupada pelo sombreamento.
+
+    Returns:
+        DefectSpec com dtype "shadowing".
+    """
+    dt = float(np.random.uniform(*dt_range))
+    h, w = mat.shape
+
+    fw = float(np.random.uniform(*area_fraction))
+    fh = float(np.random.uniform(0.2, 0.5))
+    width = int(w * fw)
+    height = int(h * fh)
+
+    start_x = int(np.random.randint(0, max(1, w - width)))
+    start_y = int(np.random.randint(0, max(1, h - height)))
+
+    mask = np.zeros_like(mat, dtype=np.float32)
+    mask[start_y : start_y + height, start_x : start_x + width] = 1.0
+    mask = cv2.GaussianBlur(mask, (5, 51), 0)
+
+    mat += mask * dt
+
+    return DefectSpec("shadowing", "Shadowing", dt, params={"area_w": width, "area_h": height, "dt": dt})
+
+
+def add_bypass_substring(
+    mat: np.ndarray,
+    dt_range: Tuple[float, float] = (10.0, 30.0),
+    n_substrings: Tuple[int, int] = (1, 2),
+) -> DefectSpec:
+    """
+    Injeta aquecimento em bandas horizontais representando atuação de bypass em substrings.
+
+    Args:
+        mat: Matriz térmica (modificada in-place).
+        dt_range: Faixa de ΔT aplicada (°C).
+        n_substrings: Intervalo do número de substrings.
+
+    Returns:
+        DefectSpec com dtype "bypass_substring".
+    """
+    dt = float(np.random.uniform(*dt_range))
+    h, _w = mat.shape
+    num = random.randint(n_substrings[0], n_substrings[1])
+
+    band = int(h / 3)
+    mask = np.zeros_like(mat, dtype=np.float32)
+
+    possible = list(range(0, h - band + 1))
+    positions = random.sample(possible, k=min(num, len(possible)))
+    for start_y in positions:
+        mask[start_y : start_y + band, :] += 1.0
+
+    mask = cv2.GaussianBlur(mask, (1, 31), 0)
+    if mask.max() > 0:
+        mask /= mask.max()
+
+    mat += mask * dt
+
+    return DefectSpec("bypass_substring", "Bypass-Substring", dt, params={"n_substrings": len(positions), "dt": dt})
+
+
+def add_open_circuit_module(mat: np.ndarray, dt_range: Tuple[float, float] = (2.0, 8.0)) -> DefectSpec:
+    """
+    Injeta deslocamento global (offset) representando módulo offline/aberto.
+
+    Args:
+        mat: Matriz térmica (modificada in-place).
+        dt_range: Faixa do offset aplicado (°C).
+
+    Returns:
+        DefectSpec com dtype "offline-module".
+    """
+    dt = float(np.random.uniform(*dt_range))
+    mat += dt
+    return DefectSpec("offline-module", "Offline-Module", dt, params={"dt": dt})
+
+
+def add_edge_frame_heating(
+    mat: np.ndarray,
+    dt_range: Tuple[float, float] = (5.0, 15.0),
+    sides: Optional[List[str]] = None,
+) -> DefectSpec:
+    """
+    Injeta aquecimento em bordas (frame) do módulo.
+
+    Args:
+        mat: Matriz térmica (modificada in-place).
+        dt_range: Faixa de ΔT aplicada (°C).
+        sides: Lista de lados ("top", "bottom", "left", "right"). Se None, sorteia 1-2 lados.
+
+    Returns:
+        DefectSpec com dtype "edge_frame".
+    """
+    dt = float(np.random.uniform(*dt_range))
+    h, w = mat.shape
+
+    if sides is None:
+        sides = random.sample(["top", "bottom", "left", "right"], random.randint(1, 2))
+
+    mask = np.zeros_like(mat, dtype=np.float32)
+    thickness_y = max(1, int(h * 0.1))
+    thickness_x = max(1, int(w * 0.05))
+
+    for side in sides:
+        if side == "top":
+            mask[:thickness_y, :] = 1.0
+        elif side == "bottom":
+            mask[h - thickness_y :, :] = 1.0
+        elif side == "left":
+            mask[:, :thickness_x] = 1.0
+        elif side == "right":
+            mask[:, w - thickness_x :] = 1.0
+
+    mask = cv2.GaussianBlur(mask, (5, 5), 0)
+    mat += (mask / (mask.max() + _EPS)) * dt
+
+    return DefectSpec("edge_frame", "Edge-Frame", dt, params={"sides": sides, "dt": dt})
+
+
+def add_false_reflection(mat: np.ndarray, dt_range: Tuple[float, float] = (-5.0, 5.0)) -> DefectSpec:
+    """
+    Injeta um padrão ruidoso/difuso representando reflexos/artefatos.
+
+    Args:
+        mat: Matriz térmica (modificada in-place).
+        dt_range: Faixa do ganho aplicado ao padrão (°C).
+
+    Returns:
+        DefectSpec com dtype "false".
+    """
+    dt = float(np.random.uniform(*dt_range))
+    h, w = mat.shape
+
+    noise = np.random.normal(0.0, 1.0, (h, w)).astype(np.float32)
+    noise = cv2.GaussianBlur(noise, (9, 9), 0)
+    noise -= noise.mean()
+    noise /= (noise.std() + _EPS)
+
+    mask = (noise - noise.min()) / (noise.max() - noise.min() + _EPS)
+    mat += (mask - 0.5) * dt
+
+    return DefectSpec("false", "False-Reflection", dt, params={"dt": dt})
+
+
+# -----------------------------------------------------------------------------
+# Defeitos "originais" (mantidos por compatibilidade)
+# -----------------------------------------------------------------------------
+def add_hotspot(mat: np.ndarray) -> DefectSpec:
+    """
+    Injeta um hotspot pontual (blob gaussiano).
+
+    Nomenclatura:
+        - hotspot -> dtype "cell"
+
+    Args:
+        mat: Matriz térmica (modificada in-place).
+
+    Returns:
+        DefectSpec com dtype "cell".
+    """
+    dt = float(np.random.uniform(15, 55))
+    cy = float(np.random.uniform(2, N_SENSORES - 2))
+    cx = float(np.random.uniform(50, X_SAMPLES - 50))
+    sy = float(np.random.uniform(0.8, 2.5))
+    sx = float(np.random.uniform(10, 60))
+    blob = gaussian2d(N_SENSORES, X_SAMPLES, cy, cx, sy, sx)
+    mat += blob * dt
+
+    return DefectSpec("cell", "Cell", dt, params={"cy": cy, "cx": cx, "dt": dt})
+
+
+def add_bypass_diode_failure(mat: np.ndarray) -> DefectSpec:
+    """
+    Injeta aquecimento em uma faixa superior (representação simplificada).
+
+    Nomenclatura:
+        - Retorna dtype "soiling" (compatibilidade com dataset atual).
+
+    Args:
+        mat: Matriz térmica (modificada in-place).
+
+    Returns:
+        DefectSpec com dtype "soiling".
+    """
+    dt = float(np.random.uniform(10, 30))
+
+    width = int(np.random.randint(2, 6))
+    start_y = 0  # sempre começa em cima
+
+    mask = np.zeros_like(mat, dtype=np.float32)
+    mask[start_y : start_y + width, :] = 1.0
+    mask = cv2.GaussianBlur(mask, (1, 15), 0)
+
+    mat += mask * dt
+
+    return DefectSpec("soiling", "Soiling", dt, params={"start_y": start_y, "width": width, "dt": dt})
+
+
+def add_crack(mat: np.ndarray) -> DefectSpec:
+    """
+    Injeta linhas finas representando trincas (cracking).
+
+    Nomenclatura:
+        - crack -> dtype "cracking"
+
+    Args:
+        mat: Matriz térmica (modificada in-place).
+
+    Returns:
+        DefectSpec com dtype "cracking".
+    """
+    dt = float(np.random.uniform(5, 20))
+    mask = np.zeros((N_SENSORES, X_SAMPLES), dtype=np.float32)
+
+    num_lines = int(np.random.randint(1, 4))
+    for _ in range(num_lines):
+        pt1 = (
+            int(np.random.randint(20, X_SAMPLES - 20)),
+            int(np.random.randint(0, N_SENSORES)),
+        )
+        pt2 = (pt1[0] + int(np.random.randint(-50, 50)), int(np.random.randint(0, N_SENSORES)))
+        cv2.line(mask, pt1, pt2, 1.0, thickness=1)
+
+    mask = cv2.GaussianBlur(mask, (3, 3), 0)
+    if mask.max() > 0:
+        mask /= mask.max()
+
+    mat += mask * dt
+
+    return DefectSpec("cracking", "Cracking", dt, params={"n_lines": num_lines, "dt": dt})
+
+
+def add_junction_box(mat: np.ndarray) -> DefectSpec:
+    """
+    Injeta hotspot alongado em uma das extremidades representando junction box.
+
+    Args:
+        mat: Matriz térmica (modificada in-place).
+
+    Returns:
+        DefectSpec com dtype "jbox".
+    """
+    dt = float(np.random.uniform(20, 60))
+    pos = "inicio" if np.random.random() > 0.5 else "fim"
+    cx = 20 if pos == "inicio" else X_SAMPLES - 20
+    cy = N_SENSORES // 2
+    sy, sx = 4.0, 30.0
+    blob = gaussian2d(N_SENSORES, X_SAMPLES, cy, cx, sy, sx)
+    mat += blob * dt
+    return DefectSpec("jbox", "Junction Box", dt, params={"pos": pos, "dt": dt})
+
+
+# =============================================================================
+# Mapeamento de defeitos
+# =============================================================================
+# Mantém chaves antigas e adiciona aliases (nomes do dataset).
+DEFECT_GENERATORS = {
+    # chaves "antigas"
+    "hotspot": add_hotspot,
+    "diode": add_bypass_diode_failure,  # OBS: retorna dtype "soiling"
+    "crack": add_crack,
+    "jbox": add_junction_box,
+    "pid": add_pid,
+    "delamination": add_delamination,
+    "ribbon": add_ribbon_failure,
+    "multi_hotspot": add_multi_hotspot,
+    "shading": add_partial_shading,
+    "bypass_substring": add_bypass_substring,
+    "open_circuit": add_open_circuit_module,
+    "edge_frame": add_edge_frame_heating,
+    "false": add_false_reflection,
+    # aliases (nomes do dataset)
+    "cell": add_hotspot,
+    "cell-multi": add_multi_hotspot,
+    "cracking": add_crack,
+    "shadowing": add_partial_shading,
+    "soiling": add_bypass_diode_failure,
+    "diode": add_pid,
+    "diode-multi": add_pid,
+    "hot-spot-multi": add_delamination,
+}
+
+
+# =============================================================================
+# Simulação com múltiplos defeitos (compatibilidade)
+# =============================================================================
+def simulate_matrix_multi(
+    defect_types: List[str],
+    base_temp: float = 30.0,
+    max_defs: int = 3,
+    min_defs: int = 0,
+    background: str = "default",
+) -> Tuple[np.ndarray, List[DefectSpec]]:
+    """
+    Gera uma matriz térmica com 0..N defeitos injetados.
+
+    Ponto crítico (aleatoriedade):
+        - A quantidade de defeitos e o tipo de defeito são amostrados aleatoriamente.
+          Para reprodutibilidade, fixe seeds de numpy/random fora desta função.
+
+    Args:
+        defect_types: Lista de chaves válidas em DEFECT_GENERATORS.
+        base_temp: Temperatura base (°C).
+        max_defs: Máximo de defeitos injetados.
+        min_defs: Mínimo de defeitos injetados.
+        background: "healthy" para fundo via healthy_background(), caso contrário usa fundo alternativo.
+
+    Returns:
+        (mat, specs) onde:
+            - mat é a matriz final com ruído adicional (float32)
+            - specs é a lista de DefectSpec gerados
+    """
+    if background == "healthy":
+        mat = healthy_background(base_temp)
+    else:
+        grad_v = np.linspace(0, np.random.uniform(0.5, 2.0), N_SENSORES).reshape(-1, 1)
+        grad_h = (np.sin(np.linspace(0, 15, X_SAMPLES)) * np.random.uniform(0.1, 0.5)).reshape(1, -1)
+        noise = np.random.normal(0, 0.2, (N_SENSORES, X_SAMPLES))
+        mat = (base_temp + grad_v + grad_h + noise).astype(np.float32)
+
+    specs: List[DefectSpec] = []
+
+    if not defect_types:
+        mat += np.random.normal(0, 0.05, mat.shape).astype(np.float32)
+        return mat, specs
+
+    n_defs = random.randint(min_defs, max_defs)
+    if n_defs <= 0:
+        mat += np.random.normal(0, 0.05, mat.shape).astype(np.float32)
+        return mat, specs
+
+    chosen = random.choices(defect_types, k=n_defs)
+    for dtype in chosen:
+        func = DEFECT_GENERATORS.get(dtype)
+        if func is not None:
+            specs.append(func(mat))
+
+    mat += np.random.normal(0, 0.05, mat.shape).astype(np.float32)
+    return mat, specs
+
+
+# =============================================================================
+# Processamento de imagem (mapeamento float -> uint8)
+# =============================================================================
+def _to_uint8(img01: np.ndarray) -> np.ndarray:
+    """Converte imagem normalizada em [0, 1] para uint8 [0, 255]."""
+    return (np.clip(img01, 0.0, 1.0) * 255.0).astype(np.uint8)
+
+
+def apply_gamma(img_u8: np.ndarray, gamma: float) -> np.ndarray:
+    """
+    Aplica correção gama usando LUT (uint8 -> uint8).
+
+    Args:
+        img_u8: Imagem uint8.
+        gamma: Exponente gamma. Se <=0 ou ==1, retorna imagem original.
+
+    Returns:
+        Imagem corrigida.
+    """
+    if gamma <= 0 or gamma == 1.0:
+        return img_u8
+    lut = np.array([((i / 255.0) ** gamma) * 255.0 for i in range(256)], dtype=np.uint8)
+    return cv2.LUT(img_u8, lut)
+
+
+def smart_agc_normalize(mat: np.ndarray, p_low: float, p_high: float, min_span: float) -> np.ndarray:
+    """
+    Normalização tipo AGC por percentis.
+
+    Args:
+        mat: Matriz térmica float.
+        p_low: Percentil inferior.
+        p_high: Percentil superior.
+        min_span: Span mínimo para evitar divisão por valores muito pequenos.
+
+    Returns:
+        Imagem uint8 (0..255).
+    """
+    mat = mat.astype(np.float32)
+    vmin = float(np.percentile(mat, p_low))
+    vmax = float(np.percentile(mat, p_high))
+    span = max(vmax - vmin, float(min_span))
+    img01 = (mat - vmin) / span
+    return _to_uint8(img01)
+
+
+def centered_delta_normalize(
+    mat: np.ndarray,
+    baseline: Optional[float] = None,
+    delta_white: float = 7.0,
+    delta_black: float = -15.0,
+) -> np.ndarray:
+    """
+    Normaliza por delta em torno de uma baseline: baseline vira cinza médio (0.5).
+
+    Implementação (mantida):
+        - Delta positivo satura para branco com escala delta_white.
+        - Delta negativo satura para preto com escala |delta_black|.
+
+    Args:
+        mat: Matriz térmica float.
+        baseline: Valor de referência (°C). Se None, usa mediana da matriz.
+        delta_white: ΔT (°C) que mapeia para branco.
+        delta_black: ΔT (°C) que mapeia para preto (valor negativo).
+
+    Returns:
+        Imagem uint8 (0..255).
+    """
+    mat = mat.astype(np.float32)
+    if baseline is None:
+        baseline = float(np.median(mat))
+
+    delta = mat - float(baseline)
+    sp = max(1e-6, float(delta_white))
+    sn = max(1e-6, float(abs(delta_black)))
+
+    pos = np.clip(delta / sp, 0.0, 1.0)
+    neg = np.clip(delta / sn, -1.0, 0.0)
+
+    img01 = 0.5 + 0.5 * pos + 0.5 * neg
+    return (np.clip(img01, 0.0, 1.0) * 255.0).astype(np.uint8)
+
+
+def gerar_realista_agc(mat: np.ndarray, color: bool = False) -> np.ndarray:
+    """
+    Gera imagem 8-bit com AGC (percentis) + blur + resize.
+
+    Args:
+        mat: Matriz térmica float.
+        color: Se True, aplica colormap (INFERNO).
+
+    Returns:
+        Imagem uint8 (grayscale) ou BGR (se color=True).
+    """
+    img = smart_agc_normalize(mat, 2.0, 98.0, min_span=SMART_AGC_MIN_SPAN)
+    img = cv2.GaussianBlur(img, (3, 3), 0)
+    img = cv2.resize(img, (TARGET_W, TARGET_H), interpolation=cv2.INTER_LINEAR)
+    img = apply_gamma(img, 1.0)
+    if color:
+        return cv2.applyColorMap(img, cv2.COLORMAP_INFERNO)
+    return img
+
+
+def gerar_realista(
+    mat: np.ndarray,
+    color: bool = False,
+    style: str = "centered",
+    delta_white: float = 15.0,
+    delta_black: float = -15.0,
+    baseline: Optional[float] = None,
+) -> np.ndarray:
+    """
+    Gera imagem 8-bit a partir de uma matriz térmica.
+
+    Modos:
+        - style="agc": usa gerar_realista_agc()
+        - caso contrário: usa centered_delta_normalize()
+
+    Args:
+        mat: Matriz térmica float.
+        color: Se True, aplica colormap (INFERNO).
+        style: "centered" ou "agc" (case-insensitive).
+        delta_white: Parâmetro de centered_delta_normalize().
+        delta_black: Parâmetro de centered_delta_normalize().
+        baseline: Baseline (°C) para centered_delta_normalize().
+
+    Returns:
+        Imagem uint8 (grayscale) ou BGR (se color=True).
+    """
+    if style.lower() == "agc":
+        return gerar_realista_agc(mat, color=color)
+
+    img = centered_delta_normalize(mat, baseline=baseline, delta_white=delta_white, delta_black=delta_black)
+    img = cv2.resize(img, (TARGET_W, TARGET_H), interpolation=cv2.INTER_LINEAR)
+
+    if color:
+        return cv2.applyColorMap(img, cv2.COLORMAP_INFERNO)
+    return img
+
+
+def gerar_delta_global(mat: np.ndarray, color: bool = False) -> np.ndarray:
+    """
+    Visualização por delta global em relação à mediana (baseline).
+
+    Args:
+        mat: Matriz térmica float.
+        color: Se True, aplica colormap.
+
+    Returns:
+        Imagem uint8 (grayscale) ou BGR.
+    """
+    baseline = float(np.median(mat))
+    delta = mat - baseline
+    dmax = float(np.percentile(delta, 99.0))
+    span = max(dmax, 5.0)
+    img = _to_uint8(delta / span)
+    img = cv2.resize(img, (TARGET_W, TARGET_H), interpolation=cv2.INTER_LINEAR)
+    img = apply_gamma(img, 0.9)
+    if color:
+        return cv2.applyColorMap(img, cv2.COLORMAP_INFERNO)
+    return img
+
+
+def gerar_delta_local(mat: np.ndarray, color: bool = False) -> np.ndarray:
+    """
+    Visualização por delta local (mat - blur(mat)).
+
+    Args:
+        mat: Matriz térmica float.
+        color: Se True, aplica colormap.
+
+    Returns:
+        Imagem uint8 (grayscale) ou BGR.
+    """
+    blur = cv2.GaussianBlur(mat, (31, 31), 0)
+    delta = mat - blur
+    dmax = float(np.percentile(delta, 99.0))
+    span = max(dmax, 5.0)
+    img = _to_uint8(delta / span)
+    img = cv2.resize(img, (TARGET_W, TARGET_H), interpolation=cv2.INTER_LINEAR)
+    img = apply_gamma(img, 0.9)
+    if color:
+        return cv2.applyColorMap(img, cv2.COLORMAP_INFERNO)
+    return img
+
+
+# =============================================================================
+# Execução de teste (visualização rápida)
+# =============================================================================
+def _quick_test() -> None:
+    """
+    Executa um teste visual rápido:
+    - Gera fundo saudável;
+    - Aplica um defeito aleatório;
+    - Mostra matriz térmica + 3 representações 8-bit.
+    """
+    seed = random.randint(0, 999999)
+    np.random.seed(seed)
+    random.seed(seed)
+
+    all_types = list(DEFECT_GENERATORS.keys())
+
+    mat0 = healthy_background(base_temp=30.0)
+    mat = mat0.copy()
+
+    dtype = random.choice(all_types)
+    spec = DEFECT_GENERATORS[dtype](mat)
+
+    baseline = float(np.median(mat0))
+
+    imgs = {
+        "Realista(centered)": gerar_realista(
+            mat, color=False, style="centered", delta_white=15.0, delta_black=-15.0, baseline=baseline
+        ),
+        "Delta Global": gerar_delta_global(mat, color=False),
+        "Delta Local": gerar_delta_local(mat, color=False),
+    }
+
+    label_real = f"DEFEITO: {spec.description} ({spec.dtype})"
+
+    fig, axes = plt.subplots(1, 4, figsize=(16, 5))
+
+    im0 = axes[0].imshow(mat, aspect="auto", cmap="inferno")
+    axes[0].set_title(f"Raw\n{label_real}")
+    plt.colorbar(im0, ax=axes[0], orientation="horizontal", pad=0.1)
+
+    for i, (k, img) in enumerate(imgs.items(), start=1):
+        axes[i].imshow(img, cmap="gray", vmin=0, vmax=255)
+        axes[i].set_title(k)
+        axes[i].axis("off")
+
+    plt.suptitle("Simulador IR (matrix_generator_v3_test)", fontsize=14)
+    plt.tight_layout()
+    plt.show()
+
+
+if __name__ == "__main__":
+    _quick_test()
