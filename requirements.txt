@@ -1,0 +1,27 @@
+
+---
+
+## requirements.txt
+
+```txt
+# =============================================================================
+# Dependências Python - Simulador IR + Dataset + Avaliação (TCC)
+# =============================================================================
+# Observação (PyTorch):
+# - torch/torchvision podem exigir comando específico conforme SO/Python/CUDA.
+# - Se necessário, instale conforme https://pytorch.org/get-started/locally/
+#   e/ou ajuste versões em https://pytorch.org/get-started/previous-versions/
+# =============================================================================
+
+numpy>=1.21
+matplotlib>=3.5
+seaborn>=0.12
+scikit-learn>=1.0
+tqdm>=4.64
+
+# OpenCV (use opencv-python-headless em ambientes sem GUI)
+opencv-python>=4.5
+
+# PyTorch (pode requerer instalação específica conforme CUDA/CPU)
+torch
+torchvision
